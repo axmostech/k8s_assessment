@@ -1,131 +1,395 @@
-# Kubernetes Assessment Script (`k8s-assessment.sh`)
-**Provided by Axmos Technologies**
+#!/bin/bash
 
-## Overview
+# --- Configuración ---
+# Nombre base para el directorio y archivos de salida
+OUTPUT_BASENAME="k8s_inventory_$(date +%Y%m%d_%H%M%S)"
+# Directorio de salida
+OUTPUT_DIR="./${OUTPUT_BASENAME}"
+# Extensión de archivo CSV
+CSV_EXT=".csv"
+# Namespaces a excluir de la recopilación detallada (cuando se usa -A)
+EXCLUDED_NAMESPACES_LIST=("kube-system" "kube-public" "kube-node-lease") # Array de namespaces
 
-This script performs a detailed assessment of a Kubernetes cluster by gathering configuration data for various key resources. Its primary purpose is to create an inventory that aids in tasks such as:
+# --- Crear directorio de salida ---
+mkdir -p "$OUTPUT_DIR"
+echo "Creando inventario en el directorio: $OUTPUT_DIR"
+echo "Excluyendo namespaces: ${EXCLUDED_NAMESPACES_LIST[*]}"
 
-*   **Cloud Migration Planning**: Specifically useful when planning migrations (e.g., from Azure Kubernetes Service (AKS) to Google Kubernetes Engine (GKE)), helping to identify resources, dependencies, and configurations that need attention.
-*   **Resource Analysis**: Understanding resource requests and limits across workloads.
-*   **Configuration Auditing**: Getting a snapshot of deployed services, storage, networking rules, and RBAC configurations.
-*   **General Cluster Inventory**: Creating a structured overview of the cluster's state.
+# --- Cabeceras CSV ---
+HEADERS_DEPLOYMENTS="Namespace,Name,ReplicasDesired,ReplicasAvailable,Strategy,Containers,Images,RequestsCPU,RequestsMemory,LimitsCPU,LimitsMemory,SelectorLabels"
+HEADERS_STATEFULSETS="Namespace,Name,ReplicasDesired,ReplicasReady,Strategy,ServiceName,VolumeClaimTemplates,Containers,Images,RequestsCPU,RequestsMemory,LimitsCPU,LimitsMemory,SelectorLabels"
+HEADERS_DAEMONSETS="Namespace,Name,DesiredScheduled,CurrentScheduled,ReadyScheduled,UpdateStrategy,Containers,Images,RequestsCPU,RequestsMemory,LimitsCPU,LimitsMemory,SelectorLabels"
+HEADERS_SERVICES="Namespace,Name,Type,ClusterIP,ExternalIP,Ports,SelectorLabels"
+HEADERS_INGRESSES="Namespace,Name,Class,Hosts,Paths,TLS_Secrets"
+HEADERS_PVCS="Namespace,Name,Status,VolumeName,StorageClass,AccessModes,RequestedCapacity"
+HEADERS_PVS="Name,Capacity,AccessModes,ReclaimPolicy,Status,ClaimNamespace,ClaimName,StorageClass,VolumeSourceType,VolumeSourceDetails"
+HEADERS_STORAGECLASSES="Name,Provisioner,ReclaimPolicy,VolumeBindingMode,AllowVolumeExpansion,Parameters"
+HEADERS_HPAS="Namespace,Name,ScaleTargetKind,ScaleTargetName,MinReplicas,MaxReplicas,CurrentReplicas,TargetMetricType,TargetMetricValue"
+HEADERS_CONFIGMAPS="Namespace,Name"
+HEADERS_SECRETS="Namespace,Name"
+HEADERS_SERVICEACCOUNTS="Namespace,Name"
+HEADERS_ROLES="Namespace,Name"
+HEADERS_ROLEBINDINGS="Namespace,Name,RoleKind,RoleName,Subjects"
+HEADERS_CLUSTERROLES="Name"
+HEADERS_CLUSTERROLEBINDINGS="Name,RoleKind,RoleName,Subjects"
+HEADERS_CRONJOBS="Namespace,Name,Schedule,Suspend,ActiveJobs,LastScheduleTime"
+HEADERS_JOBS="Namespace,Name,Completions,Duration,Status"
+HEADERS_NAMESPACES="Name,Status,Age"
 
-The script extracts information using `kubectl` and `jq`, processing the data into multiple CSV (Comma-Separated Values) files, making it easy to analyze using spreadsheet software or other data analysis tools. It focuses on collecting metadata and configuration details relevant for assessment, **without** reading sensitive data like Secret values.
 
-## Prerequisites
+# --- Funciones Auxiliares ---
 
-Before running this script, ensure you have the following:
+# Función para inicializar archivo CSV con cabecera
+init_csv() {
+    local filepath="$1"
+    local headers="$2"
+    echo "$headers" > "$filepath"
+    echo "Creado archivo: $filepath"
+}
 
-1.  **`kubectl`**: Installed and configured with access to the target Kubernetes cluster you wish to assess. Verify connectivity with `kubectl cluster-info`.
-2.  **`jq`**: The command-line JSON processor must be installed. You can typically install it using your system's package manager:
-    *   Debian/Ubuntu: `sudo apt-get update && sudo apt-get install jq`
-    *   CentOS/RHEL/Fedora: `sudo yum install jq` or `sudo dnf install jq`
-    *   macOS (using Homebrew): `brew install jq`
-3.  **Bash Shell**: A standard Bash-compatible shell environment (common in Linux and macOS).
-4.  **Kubernetes Permissions**: The `kubectl` context used must have sufficient RBAC (Role-Based Access Control) permissions to `get` and `list` the targeted resources across relevant namespaces and cluster-scoped resources. For a comprehensive assessment, read-only permissions equivalent to `view` or potentially `cluster-admin` (if needing to list *all* resources without restriction) might be necessary. The script performs **read-only** operations.
+# Construye el field-selector para excluir namespaces
+build_excluded_ns_selector() {
+    local selector=""
+    for ns_to_exclude in "${EXCLUDED_NAMESPACES_LIST[@]}"; do
+        if [ -n "$selector" ]; then
+            selector+=","
+        fi
+        selector+="metadata.namespace!=$ns_to_exclude"
+    done
+    echo "$selector"
+}
 
-## Usage Instructions
+# Función para extraer recursos y añadirlos al CSV correspondiente
+# Uso: extract_to_csv <ResourceKind> <CSVFilePath> <Headers> <jqFilter> [-A | -n namespace | ""]
+extract_to_csv() {
+    local resource_kind=$1
+    local csv_filepath=$2
+    local headers=$3
+    local jq_filter=$4
+    local scope_arg=$5 # Puede ser -A, -n namespace, o "" para cluster-scoped
 
-1.  **Save the Script**: Save the script content provided to a file named `k8s-assessment.sh`.
-2.  **Make it Executable**: Open your terminal/command prompt, navigate to the directory where you saved the file, and grant execute permissions:
-    ```bash
-    chmod +x k8s-assessment.sh
-    ```
-3.  **Run the Script**: Execute the script from the same directory:
-    ```bash
-    ./k8s-assessment.sh
-    ```
-4.  **Execution Process**:
-    *   The script will first create a timestamped directory (e.g., `k8s_inventory_20231027_103000/`) in the current working directory.
-    *   It will then proceed to query the Kubernetes API for different resource types.
-    *   Progress messages indicating which resource type is being processed will be printed to the console.
-    *   For each resource type, a corresponding CSV file will be created inside the timestamped directory.
-    *   Finally, the script will create a compressed tarball archive (`.tar.gz`) containing the entire output directory (e.g., `k8s_inventory_20231027_103000.tar.gz`) in the current working directory for easy sharing and storage.
+    echo "Procesando: $resource_kind"
+    init_csv "$csv_filepath" "$headers"
 
-## What Data is Collected?
+    local k_cmd_array=("kubectl" "get" "$resource_kind")
 
-The script queries the Kubernetes API to gather information about the following resource types:
+    if [[ "$scope_arg" == "-A" ]]; then
+        k_cmd_array+=("-A")
+        local excluded_selector
+        excluded_selector=$(build_excluded_ns_selector)
+        if [ -n "$excluded_selector" ]; then
+            k_cmd_array+=("--field-selector" "$excluded_selector")
+        fi
+    elif [[ -n "$scope_arg" && "$scope_arg" != "" ]]; then # Para un namespace específico (ej: -n my-ns)
+        # Asegura que el argumento se divida correctamente (ej. "-n", "mynamespace")
+        read -r -a scope_parts <<< "$scope_arg"
+        k_cmd_array+=("${scope_parts[@]}")
+    fi
+    # Si scope_arg es "", no se añaden flags de namespace (para cluster-scoped)
 
-*   **Namespaces**: List of all namespaces, their status, and age.
-*   **Workloads**:
-    *   `Deployments`: Replica counts, strategy, container images, resource requests/limits, selectors.
-    *   `StatefulSets`: Replica counts, strategy, service name, volume claim templates, container images, resource requests/limits, selectors.
-    *   `DaemonSets`: Scheduling status, update strategy, container images, resource requests/limits, selectors.
-    *   `CronJobs`: Schedule, suspend status, active job count, last schedule time.
-    *   `Jobs`: Completion count, status, duration.
-*   **Networking**:
-    *   `Services`: Type (ClusterIP, NodePort, LoadBalancer), ClusterIP, External/LoadBalancer IP(s), ports, selectors.
-    *   `Ingresses` (networking.k8s.io/v1): Ingress class, host rules, backend paths, TLS configuration (secret names).
-*   **Storage**:
-    *   `PersistentVolumeClaims` (PVCs): Status, bound Volume name, storage class, access modes, requested capacity.
-    *   `PersistentVolumes` (PVs): Capacity, access modes, reclaim policy, status, claim reference (namespace/name), storage class, volume source type (e.g., `AzureDisk`, `GCEPersistentDisk`, `CSI`, `NFS`).
-    *   `StorageClasses`: Provisioner name, reclaim policy, volume binding mode, parameters.
-*   **Configuration**:
-    *   `ConfigMaps`: Namespace and name only. **Values are NOT read.**
-    *   `Secrets`: Namespace and name only. **Values are NOT read.** Auto-generated `kubernetes.io/service-account-token` secrets are excluded.
-*   **Autoscaling**:
-    *   `HorizontalPodAutoscalers` (HPAs): Target workload (kind/name), min/max replica counts, current replica count, target metrics definition.
-*   **RBAC & Service Accounts**:
-    *   `ServiceAccounts`: Namespace and name only.
-    *   `Roles`: Namespace and name only.
-    *   `RoleBindings`: Namespace, name, role reference (Kind/Name), subjects (users, groups, service accounts).
-    *   `ClusterRoles`: Name only.
-    *   `ClusterRoleBindings`: Name, role reference (Kind/Name), subjects.
+    k_cmd_array+=("-o" "json")
 
-## Generated Output Files (CSVs)
+    # echo "Ejecutando: ${k_cmd_array[*]}" # Descomentar para depurar
+    if ! output=$("${k_cmd_array[@]}"); then
+         echo "Advertencia: Falló el comando kubectl para $resource_kind. ${output}"
+         # Continuar aunque falle kubectl para este recurso
+         echo "Completado (con error): $resource_kind"
+         return # Salir de la función para este recurso
+    fi
 
-The script generates the following CSV files within the timestamped output directory:
+    if ! echo "$output" | jq -r "$jq_filter" | sed 's/"//g' >> "$csv_filepath"; then
+         echo "Advertencia: Falló jq o sed al procesar $resource_kind. El archivo CSV puede estar incompleto."
+         # Continuar aunque falle jq/sed
+    fi
 
-*   `namespaces.csv`
-*   `deployments.csv`
-*   `statefulsets.csv`
-*   `daemonsets.csv`
-*   `services.csv`
-*   `ingresses.csv`
-*   `persistentvolumeclaims.csv`
-*   `persistentvolumes.csv`
-*   `storageclasses.csv`
-*   `horizontalpodautoscalers.csv`
-*   `configmaps.csv`
-*   `secrets.csv`
-*   `serviceaccounts.csv`
-*   `roles.csv`
-*   `rolebindings.csv`
-*   `clusterroles.csv`
-*   `clusterrolebindings.csv`
-*   `cronjobs.csv`
-*   `jobs.csv`
 
-Each CSV file contains columns corresponding to the key information gathered for that resource type, as listed in the section above.
+    # Eliminar última línea si está vacía (puede ocurrir si jq no produce salida)
+    [[ $(tail -n 1 "$csv_filepath" 2>/dev/null) == "" ]] && sed -i '$ d' "$csv_filepath" 2>/dev/null
+    echo "Completado: $resource_kind"
+}
 
-**Additionally, a `.tar.gz` archive containing all these CSV files is created in the directory where the script was run.**
+# Función específica para recursos que sólo necesitan listar nombres (ConfigMaps, Secrets)
+extract_names_only() {
+    local resource_kind=$1
+    local csv_filepath=$2
+    local headers=$3
 
-## Important: Excluded Namespaces
+    echo "Procesando (solo nombres): $resource_kind"
+    init_csv "$csv_filepath" "$headers"
 
-By default, the script **excludes** resources from the following namespaces during the detailed collection process to focus on user-deployed applications and avoid capturing internal/managed components:
+    local k_cmd_array=("kubectl" "get" "$resource_kind")
+    k_cmd_array+=("-A") # Siempre queremos todos los namespaces para esta función base
 
-*   `kube-system`
-*   `kube-public`
-*   `kube-node-lease`
+    local excluded_selector
+    excluded_selector=$(build_excluded_ns_selector)
+    if [ -n "$excluded_selector" ]; then
+        k_cmd_array+=("--field-selector" "$excluded_selector")
+    fi
 
-This behavior is intentional. Components within these namespaces are typically managed by the Kubernetes platform provider (like AKS, EKS, GKE) and are not meant to be directly migrated or managed by users in the same way application workloads are. Capturing them would add significant noise irrelevant to most application migration assessments. The full list of all namespaces *is* captured in `namespaces.csv` for completeness.
+    k_cmd_array+=("-o" "custom-columns=NAMESPACE:.metadata.namespace,NAME:.metadata.name" "--no-headers")
 
-The exclusion list (`EXCLUDED_NAMESPACES_LIST`) can be modified near the top of the `k8s-assessment.sh` script if necessary for specific use cases, but this is generally not recommended for standard assessments.
+    # echo "Ejecutando: ${k_cmd_array[*]}" # Descomentar para depurar
+    if ! "${k_cmd_array[@]}" | awk '{print $1","$2}' >> "$csv_filepath"; then
+      echo "Advertencia: No se pudieron obtener nombres para $resource_kind. El archivo CSV podría estar vacío."
+    fi
 
-## Attribution
+    [[ $(tail -n 1 "$csv_filepath" 2>/dev/null) == "" ]] && sed -i '$ d' "$csv_filepath" 2>/dev/null
+    echo "Completado (solo nombres): $resource_kind"
+}
 
-This Kubernetes assessment script is provided by **Axmos Technologies**.
 
-## Support and Questions
+# --- Extracción de Datos ---
 
-For further assistance, questions regarding this script, understanding the output, or inquiries about application modernization strategies and cloud migration services, please do not hesitate to contact the **Axmos App Mod (Application Modernization) team**.
+echo "Iniciando extracción de datos de Kubernetes..."
 
-*   **Contact**: felipe@axmos.tech, cristobal@axmos.tech 
+# 1. Namespaces (Cluster Scope, pero lo listamos primero)
+NAMESPACE_CSV="${OUTPUT_DIR}/namespaces${CSV_EXT}"
+extract_to_csv "namespaces" "$NAMESPACE_CSV" "$HEADERS_NAMESPACES" '.items[] | [.metadata.name, .status.phase, (.metadata.creationTimestamp | sub("\\.[0-9]+Z$";"Z"))] | @csv' "" # Scope "" para cluster, sin filtro NS aquí
 
-## Notes and Disclaimers
 
-*   **Read-Only Operation**: The script uses `kubectl get` commands, which are read-only operations. It does not make any changes to your Kubernetes cluster configuration.
-*   **Data Sensitivity**: While the script avoids reading sensitive data like secret values, the collected metadata (resource names, labels, image names, configurations) might still be considered sensitive within your organization's context. Please handle the generated CSV files and tarball securely and according to your company's policies.
-*   **Performance Impact**: On very large clusters with thousands of resources, the script might take a considerable amount of time to complete and may consume noticeable CPU/memory on the machine where `kubectl` and `jq` are executed.
-*   **Analysis Required**: The generated CSV files provide raw inventory data. This data serves as a foundation for further analysis, interpretation, and decision-making regarding migration efforts, resource optimization, or configuration reviews.
+# 2. Workloads (Deployments, StatefulSets, DaemonSets) - Iterando por contenedores
+DEPLOYMENT_CSV="${OUTPUT_DIR}/deployments${CSV_EXT}"
+JQ_DEPLOYMENTS='.items[] | . as $dep | .spec.template.spec.containers[] | [
+    $dep.metadata.namespace,
+    $dep.metadata.name,
+    ($dep.spec.replicas // "N/A"),
+    ($dep.status.availableReplicas // "N/A"),
+    ($dep.spec.strategy.type // "RollingUpdate"),
+    .name,
+    .image,
+    (.resources.requests.cpu // "N/A"),
+    (.resources.requests.memory // "N/A"),
+    (.resources.limits.cpu // "N/A"),
+    (.resources.limits.memory // "N/A"),
+    ($dep.spec.selector.matchLabels | to_entries | map("\(.key)=\(.value)") | join(";") // "N/A")
+] | @csv'
+extract_to_csv "deployments" "$DEPLOYMENT_CSV" "$HEADERS_DEPLOYMENTS" "$JQ_DEPLOYMENTS" "-A"
+
+STATEFULSET_CSV="${OUTPUT_DIR}/statefulsets${CSV_EXT}"
+JQ_STATEFULSETS='.items[] | . as $sts | .spec.template.spec.containers[] | [
+    $sts.metadata.namespace,
+    $sts.metadata.name,
+    ($sts.spec.replicas // "N/A"),
+    ($sts.status.readyReplicas // "N/A"),
+    ($sts.spec.updateStrategy.type // "RollingUpdate"),
+    ($sts.spec.serviceName // "N/A"),
+    ($sts.spec.volumeClaimTemplates | map(.metadata.name) | join(";") // "N/A"),
+    .name,
+    .image,
+    (.resources.requests.cpu // "N/A"),
+    (.resources.requests.memory // "N/A"),
+    (.resources.limits.cpu // "N/A"),
+    (.resources.limits.memory // "N/A"),
+    ($sts.spec.selector.matchLabels | to_entries | map("\(.key)=\(.value)") | join(";") // "N/A")
+] | @csv'
+extract_to_csv "statefulsets" "$STATEFULSET_CSV" "$HEADERS_STATEFULSETS" "$JQ_STATEFULSETS" "-A"
+
+DAEMONSET_CSV="${OUTPUT_DIR}/daemonsets${CSV_EXT}"
+JQ_DAEMONSETS='.items[] | . as $ds | .spec.template.spec.containers[] | [
+    $ds.metadata.namespace,
+    $ds.metadata.name,
+    ($ds.status.desiredNumberScheduled // "N/A"),
+    ($ds.status.currentNumberScheduled // "N/A"),
+    ($ds.status.numberReady // "N/A"),
+    ($ds.spec.updateStrategy.type // "RollingUpdate"),
+    .name,
+    .image,
+    (.resources.requests.cpu // "N/A"),
+    (.resources.requests.memory // "N/A"),
+    (.resources.limits.cpu // "N/A"),
+    (.resources.limits.memory // "N/A"),
+    ($ds.spec.selector.matchLabels | to_entries | map("\(.key)=\(.value)") | join(";") // "N/A")
+] | @csv'
+extract_to_csv "daemonsets" "$DAEMONSET_CSV" "$HEADERS_DAEMONSETS" "$JQ_DAEMONSETS" "-A"
+
+
+# 3. Networking (Services, Ingresses)
+SERVICE_CSV="${OUTPUT_DIR}/services${CSV_EXT}"
+JQ_SERVICES='.items[] | [
+    .metadata.namespace,
+    .metadata.name,
+    .spec.type,
+    (.spec.clusterIP // "N/A"),
+    (if .spec.type == "LoadBalancer" then (.status.loadBalancer.ingress | map(.ip // .hostname) | join(";")) else (if .spec.externalIPs then (.spec.externalIPs | join(";")) else "N/A" end) end), # Añadido soporte para externalIPs
+    (.spec.ports | map("\(.name // ""):\(.port):\(.targetPort):\(.protocol):\(.nodePort // "")") | join(";") // "N/A"),
+    (.spec.selector | to_entries | map("\(.key)=\(.value)") | join(";") // "N/A")
+] | @csv'
+extract_to_csv "services" "$SERVICE_CSV" "$HEADERS_SERVICES" "$JQ_SERVICES" "-A"
+
+INGRESS_CSV="${OUTPUT_DIR}/ingresses${CSV_EXT}"
+JQ_INGRESSES='.items[] | [
+    .metadata.namespace,
+    .metadata.name,
+    (.spec.ingressClassName // (.metadata.annotations."kubernetes.io/ingress.class" // "N/A")),
+    (.spec.rules | map(.host // "*") | join(";") // "N/A"),
+    (.spec.rules | map(.http.paths | map("\(.path // "/")(\(.pathType // "Prefix")) -> \(.backend.service.name):\(.backend.service.port.name // (.backend.service.port.number | tostring))") | join(",")) | join(";") // "N/A"), # Añadido pathType
+    (.spec.tls | map(.secretName // "(default cert)") | join(";") // "N/A")
+] | @csv'
+extract_to_csv "ingresses.networking.k8s.io" "$INGRESS_CSV" "$HEADERS_INGRESSES" "$JQ_INGRESSES" "-A" # Usar nombre completo api
+
+
+# 4. Storage (PVCs, PVs, StorageClasses)
+PVC_CSV="${OUTPUT_DIR}/persistentvolumeclaims${CSV_EXT}"
+JQ_PVCS='.items[] | [
+    .metadata.namespace,
+    .metadata.name,
+    .status.phase,
+    (.spec.volumeName // "N/A"),
+    (.spec.storageClassName // "default"), # Default si no especificado
+    (.spec.accessModes | join(";") // "N/A"),
+    (.spec.resources.requests.storage // (.status.capacity.storage // "N/A")) # Usa status.capacity si spec.resources no está
+] | @csv'
+extract_to_csv "persistentvolumeclaims" "$PVC_CSV" "$HEADERS_PVCS" "$JQ_PVCS" "-A"
+
+PV_CSV="${OUTPUT_DIR}/persistentvolumes${CSV_EXT}"
+JQ_PVS='.items[] | [
+    .metadata.name,
+    (.spec.capacity.storage // "N/A"),
+    (.spec.accessModes | join(";") // "N/A"),
+    .spec.persistentVolumeReclaimPolicy,
+    .status.phase,
+    (.spec.claimRef.namespace // "N/A"),
+    (.spec.claimRef.name // "N/A"),
+    (.spec.storageClassName // "default"),
+    (if .spec.gcePersistentDisk then "GCE PD" elif .spec.awsElasticBlockStore then "AWS EBS" elif .spec.azureDisk then "AzureDisk" elif .spec.azureFile then "AzureFile" elif .spec.csi then "CSI (" + (.spec.csi.driver // "?") + ")" elif .spec.nfs then "NFS" elif .spec.hostPath then "HostPath" else "Other/Unknown" end), # Mejorado CSI
+    (if .spec.gcePersistentDisk then .spec.gcePersistentDisk.pdName elif .spec.awsElasticBlockStore then .spec.awsElasticBlockStore.volumeID elif .spec.azureDisk then .spec.azureDisk.diskName elif .spec.azureFile then .spec.azureFile.shareName elif .spec.csi then .spec.csi.volumeHandle else "N/A" end)
+] | @csv'
+extract_to_csv "persistentvolumes" "$PV_CSV" "$HEADERS_PVS" "$JQ_PVS" "" # Cluster-scoped
+
+STORAGECLASS_CSV="${OUTPUT_DIR}/storageclasses${CSV_EXT}"
+JQ_STORAGECLASSES='.items[] | [
+    .metadata.name,
+    .provisioner,
+    (.reclaimPolicy // "Delete"),
+    (.volumeBindingMode // "Immediate"),
+    (.allowVolumeExpansion // "false"),
+    (.parameters | to_entries | map("\(.key)=\(.value)") | join(";") // "N/A")
+] | @csv'
+extract_to_csv "storageclasses.storage.k8s.io" "$STORAGECLASS_CSV" "$HEADERS_STORAGECLASSES" "$JQ_STORAGECLASSES" "" # Usar nombre completo api
+
+
+# 5. Autoscaling (HPAs)
+HPA_CSV="${OUTPUT_DIR}/horizontalpodautoscalers${CSV_EXT}"
+JQ_HPAS='.items[] | [
+    .metadata.namespace,
+    .metadata.name,
+    .spec.scaleTargetRef.kind,
+    .spec.scaleTargetRef.name,
+    (.spec.minReplicas // "N/A"),
+    .spec.maxReplicas,
+    (.status.currentReplicas // "N/A"),
+    (.spec.metrics | map(.type + ":" + (if .type == "Resource" then .resource.name else (.pods // .external // .object).metric.name end) ) | join(";") // "N/A"),
+    (.spec.metrics | map(.type + ":" + (if .type == "Resource" then ((.resource.target.averageUtilization | tostring // "N/A") + "%" // (.resource.target.averageValue // "N/A")) else ((.pods // .external // .object).target.averageValue // (.pods // .external // .object).target.value // "N/A") end) ) | join(";") // "N/A")
+] | @csv'
+extract_to_csv "horizontalpodautoscalers.autoscaling" "$HPA_CSV" "$HEADERS_HPAS" "$JQ_HPAS" "-A" # Usar nombre completo api
+
+
+# 6. Configuration (ConfigMaps, Secrets - Names Only)
+CONFIGMAP_CSV="${OUTPUT_DIR}/configmaps${CSV_EXT}"
+extract_names_only "configmaps" "$CONFIGMAP_CSV" "$HEADERS_CONFIGMAPS"
+
+SECRET_CSV="${OUTPUT_DIR}/secrets${CSV_EXT}"
+# Filtrar secretos de tipo service-account-token que son autogenerados
+init_csv "$SECRET_CSV" "$HEADERS_SECRETS"
+k_cmd_array_secrets=("kubectl" "get" "secrets" "-A")
+excluded_selector_secrets=$(build_excluded_ns_selector)
+if [ -n "$excluded_selector_secrets" ]; then
+    k_cmd_array_secrets+=("--field-selector" "$excluded_selector_secrets,type!=kubernetes.io/service-account-token")
+else
+     k_cmd_array_secrets+=("--field-selector" "type!=kubernetes.io/service-account-token")
+fi
+k_cmd_array_secrets+=("-o" "custom-columns=NAMESPACE:.metadata.namespace,NAME:.metadata.name" "--no-headers")
+if ! "${k_cmd_array_secrets[@]}" | awk '{print $1","$2}' >> "$SECRET_CSV"; then
+    echo "Advertencia: No se pudieron obtener nombres para secrets. El archivo CSV podría estar vacío."
+fi
+[[ $(tail -n 1 "$SECRET_CSV" 2>/dev/null) == "" ]] && sed -i '$ d' "$SECRET_CSV" 2>/dev/null
+echo "Completado (solo nombres): secrets (excluyendo service-account-token)"
+
+
+# 7. RBAC & Service Accounts (Basic Info)
+SERVICEACCOUNT_CSV="${OUTPUT_DIR}/serviceaccounts${CSV_EXT}"
+extract_names_only "serviceaccounts" "$SERVICEACCOUNT_CSV" "$HEADERS_SERVICEACCOUNTS"
+
+ROLE_CSV="${OUTPUT_DIR}/roles${CSV_EXT}"
+init_csv "$ROLE_CSV" "$HEADERS_ROLES"
+k_cmd_array_roles=("kubectl" "get" "roles.rbac.authorization.k8s.io" "-A") # Usar nombre completo api
+excluded_selector_roles=$(build_excluded_ns_selector)
+if [ -n "$excluded_selector_roles" ]; then
+    k_cmd_array_roles+=("--field-selector" "$excluded_selector_roles")
+fi
+k_cmd_array_roles+=("-o" "custom-columns=NAMESPACE:.metadata.namespace,NAME:.metadata.name" "--no-headers")
+if ! "${k_cmd_array_roles[@]}" | awk '{print $1","$2}' >> "$ROLE_CSV"; then
+   echo "Advertencia: No se pudieron obtener nombres para roles. El archivo CSV podría estar vacío."
+fi
+[[ $(tail -n 1 "$ROLE_CSV" 2>/dev/null) == "" ]] && sed -i '$ d' "$ROLE_CSV" 2>/dev/null
+
+
+ROLEBINDING_CSV="${OUTPUT_DIR}/rolebindings${CSV_EXT}"
+JQ_ROLEBINDINGS='.items[] | [
+    .metadata.namespace,
+    .metadata.name,
+    .roleRef.kind,
+    .roleRef.name,
+    (.subjects | map(.kind + ":" + .name + (if .namespace then "("+ .namespace +")" else "" end)) | join(";") // "N/A")
+] | @csv'
+extract_to_csv "rolebindings.rbac.authorization.k8s.io" "$ROLEBINDING_CSV" "$HEADERS_ROLEBINDINGS" "$JQ_ROLEBINDINGS" "-A" # Usar nombre completo api
+
+CLUSTERROLE_CSV="${OUTPUT_DIR}/clusterroles${CSV_EXT}"
+init_csv "$CLUSTERROLE_CSV" "$HEADERS_CLUSTERROLES"
+if ! kubectl get clusterroles.rbac.authorization.k8s.io -o custom-columns=NAME:.metadata.name --no-headers >> "$CLUSTERROLE_CSV"; then # Usar nombre completo api
+   echo "Advertencia: No se pudieron obtener nombres para clusterroles. El archivo CSV podría estar vacío."
+fi
+[[ $(tail -n 1 "$CLUSTERROLE_CSV" 2>/dev/null) == "" ]] && sed -i '$ d' "$CLUSTERROLE_CSV" 2>/dev/null
+
+CLUSTERROLEBINDING_CSV="${OUTPUT_DIR}/clusterrolebindings${CSV_EXT}"
+JQ_CLUSTERROLEBINDINGS='.items[] | [
+    .metadata.name,
+    .roleRef.kind,
+    .roleRef.name,
+    (.subjects | map(.kind + ":" + .name + (if .namespace then "("+ .namespace +")" else "" end)) | join(";") // "N/A")
+] | @csv'
+extract_to_csv "clusterrolebindings.rbac.authorization.k8s.io" "$CLUSTERROLEBINDING_CSV" "$HEADERS_CLUSTERROLEBINDINGS" "$JQ_CLUSTERROLEBINDINGS" "" # Usar nombre completo api
+
+
+# 8. Jobs & CronJobs
+CRONJOB_CSV="${OUTPUT_DIR}/cronjobs${CSV_EXT}"
+JQ_CRONJOBS='.items[] | [
+    .metadata.namespace,
+    .metadata.name,
+    .spec.schedule,
+    (.spec.suspend // "false"),
+    (.status.active | length // 0),
+    ((.status.lastScheduleTime // "N/A") | if . != "N/A" then sub("\\.[0-9]+Z$";"Z") else . end)
+] | @csv'
+extract_to_csv "cronjobs.batch" "$CRONJOB_CSV" "$HEADERS_CRONJOBS" "$JQ_CRONJOBS" "-A" # Usar nombre completo api
+
+JOB_CSV="${OUTPUT_DIR}/jobs${CSV_EXT}"
+JQ_JOBS='.items[] | [
+    .metadata.namespace,
+    .metadata.name,
+    (.spec.completions // "N/A"),
+     (if .status.startTime and .status.completionTime then ((.status.completionTime | fromdateiso8601) - (.status.startTime | fromdateiso8601) | tostring) + "s" else "N/A" end),
+    (if .status.succeeded and .status.succeeded > 0 then "Succeeded" elif .status.failed and .status.failed > 0 then "Failed" elif .status.active and .status.active > 0 then "Active" else "Unknown/Pending" end) # Mejorado status
+] | @csv'
+extract_to_csv "jobs.batch" "$JOB_CSV" "$HEADERS_JOBS" "$JQ_JOBS" "-A" # Usar nombre completo api
+
+
+# --- Finalización ---
+echo "------------------------------------------"
+echo "Inventario de Kubernetes completado."
+echo "Archivos CSV generados en: $OUTPUT_DIR"
+echo "Se excluyeron los namespaces: ${EXCLUDED_NAMESPACES_LIST[*]} de la recolección detallada de recursos."
+
+# Crear un tarball del directorio
+TARBALL_NAME="${OUTPUT_BASENAME}.tar.gz"
+echo "Creando archivo tar.gz: ${TARBALL_NAME}..."
+# Usar -C para cambiar al directorio padre antes de archivar, evita incluir ./ en la ruta
+# Usar basename para obtener solo el nombre del directorio a archivar
+if tar -czf "${TARBALL_NAME}" -C "$(dirname "$OUTPUT_DIR")" "$(basename "$OUTPUT_DIR")"; then
+    echo "Archivo tarball creado exitosamente: ${TARBALL_NAME}"
+else
+    echo "Error: No se pudo crear el archivo tarball ${TARBALL_NAME}."
+fi
+
+exit 0
 
